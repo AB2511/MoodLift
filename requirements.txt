@@ -1,0 +1,7 @@
+streamlit
+pandas
+mysql-connector-python
+transformers
+torch
+numpy
+python-dotenv
