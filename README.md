@@ -17,6 +17,9 @@ MoodLift is a personalized mental well-being companion designed to support users
 - **Chain LLM Calls**: Analyzes embeddings to provide personalized suggestions and predictions.
 - **Multi-Step Flow**: Automates from mood input to resource recommendation in a single workflow.
 
+## Live Demo
+Experience MoodLift live at [https://moodlift.streamlit.app/](https://moodlift.streamlit.app/). Try logging a mood and exploring the features!
+
 ## Prerequisites
 - Python 3.8+
 - TiDB Cloud account (free tier or trial)
