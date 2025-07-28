@@ -50,11 +50,21 @@ st.set_page_config(page_title="MoodLift", page_icon=":smiley:", layout="wide")
 st.markdown("""
     <style>
     .stApp {
-        background-color: #f0f4f8;
+        background-color: #2c3e50; /* Darker background */
+        color: #ecf0f1; /* Light text for contrast */
     }
     .stButton>button {
-        background-color: #4CAF50;
+        background-color: #27ae60; /* Slightly darker green button */
         color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+    }
+    .stSelectbox, .stTextArea, .stWrite {
+        color: #ecf0f1; /* Light text in inputs and text areas */
+        background-color: #34495e; /* Darker input background */
+        border: 1px solid #7f8c8d;
+        border-radius: 5px;
     }
     @media (max-width: 600px) {
         .stApp {
@@ -324,16 +334,6 @@ if top_tracks:
         st.write(f"**{name}** by {artist} - [Listen]({url})")
 else:
     st.write("No tracks found for this mood.")
-
-st.subheader("Save Playlist")
-if st.button("Create Playlist"):
-    tracks = requests.get("https://api.spotify.com/v1/search", headers={"Authorization": f"Bearer {get_spotify_token()}"}, params={"q": f"genre:{mood.lower()}", "type": "track", "limit": 5}).json()["tracks"]["items"]
-    track_uris = [track["uri"] for track in tracks]
-    playlist_url = create_playlist(mood, track_uris)
-    if playlist_url:
-        st.write(f"Playlist created! [Listen on Spotify]({playlist_url})")
-    else:
-        st.write("Failed to create playlist. Ensure Spotify credentials are set and user ID is configured.")
 
 if __name__ == "__main__":
     st.markdown("<p style='color: #757575; font-size: 10px; text-align: center;'>Powered by MoodLift | Supporting mental health globally</p>", unsafe_allow_html=True)
