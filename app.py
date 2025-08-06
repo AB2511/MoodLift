@@ -15,6 +15,7 @@ from dotenv import load_dotenv  # For local development
 
 # Load .env file for local development
 load_dotenv()
+
 # Determine environment and load secrets
 is_cloud = hasattr(st, 'secrets')
 if is_cloud:
@@ -76,134 +77,209 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Global variables
-tokenizer = None
-model = None
+# Get Spotify access token
+@st.cache_data(ttl=3600)  # Cache token for 1 hour
+def get_spotify_token():
+    auth_url = "https://accounts.spotify.com/api/token"
+    auth_response = requests.post(auth_url, {
+        "grant_type": "client_credentials",
+        "client_id": SPOTIFY_CLIENT_ID,
+        "client_secret": SPOTIFY_CLIENT_SECRET,
+    }, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if auth_response.status_code == 200:
+        return auth_response.json().get("access_token")
+    st.error(f"Token request failed: {auth_response.text}")
+    return None
 
-# Load NLP model
-try:
-    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2").to('cpu')
-except Exception as e:
-    st.error(f"Error loading NLP model: {str(e)}")
-    tokenizer = None
-    model = None
+# Get top tracks based on mood
+@st.cache_data
+def get_top_mood_tracks(mood, limit=5):
+    token = get_spotify_token()
+    if not token:
+        return []
+    headers = {"Authorization": f"Bearer {token}"}
+    mood_queries = {
+        "Happy": "genre:pop mood:happy",
+        "Sad": "genre:acoustic mood:sad",
+        "Anxious": "genre:classical mood:calm",
+        "Calm": "genre:instrumental mood:relax"
+    }
+    query = mood_queries.get(mood, "genre:instrumental mood:relax")
+    response = requests.get("https://api.spotify.com/v1/search", headers=headers, params={"q": query, "type": "track", "limit": limit})
+    if response.status_code == 200:
+        data = response.json()
+        return [(track["name"], track["artists"][0]["name"], track["external_urls"]["spotify"]) for track in data["tracks"]["items"]]
+    st.error(f"Search failed: {response.text}")
+    return []
 
-# Database connection
-@st.cache_resource
-def get_connection():
+# Create a playlist (simplified, requires user auth for full functionality)
+def create_playlist(mood, track_uris):
+    token = get_spotify_token()
+    if not token:
+        return None
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    # Placeholder user_id (replace with authenticated user ID in full implementation)
+    user_id = "your_user_id"  # Requires OAuth for real use
+    playlist_name = f"MoodLift - {mood} Playlist"
+    playlist_data = {"name": playlist_name, "description": f"Playlist for {mood} mood", "public": False}
+    create_response = requests.post(f"https://api.spotify.com/v1/users/{user_id}/playlists", headers=headers, json=playlist_data)
+    if create_response.status_code == 201:
+        playlist = create_response.json()
+        add_response = requests.post(f"https://api.spotify.com/v1/playlists/{playlist['id']}/tracks", headers=headers, json={"uris": track_uris})
+        if add_response.status_code == 201:
+            return playlist["external_urls"]["spotify"]
+    st.error(f"Playlist creation failed: {create_response.text}")
+    return None
+
+# TiDB Connection
+def get_connection(autocommit: bool = True) -> MySQLConnection:
+    config = {
+        "host": TIDB_HOST,
+        "port": TIDB_PORT,
+        "user": TIDB_USER,
+        "password": TIDB_PASSWORD,
+        "database": TIDB_DB_NAME,
+        "autocommit": autocommit,
+        "use_pure": True,
+    }
+    if CA_PATH and os.path.exists(CA_PATH):
+        config["ssl_verify_cert"] = True
+        config["ssl_verify_identity"] = True
+        config["ssl_ca"] = CA_PATH
     try:
-        conn = mysql.connector.connect(
-            host=TIDB_HOST,
-            port=TIDB_PORT,
-            user=TIDB_USER,
-            password=TIDB_PASSWORD,
-            database=TIDB_DB_NAME,
-            ssl_ca=CA_PATH if CA_PATH else None
-        )
+        conn = mysql.connector.connect(**config)
+        with conn.cursor() as cur:
+            cur.execute("SELECT DATABASE()")
+            db_name = cur.fetchone()[0]
+            print(f"Connected to database: {db_name}")
         return conn
     except Exception as e:
         st.error(f"Database connection failed: {str(e)}")
         return None
 
-# Embedding generation
+# Check if 'mood' column exists
+def check_mood_column(conn):
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM resources LIKE 'mood'")
+            return cur.fetchone() is not None
+    except Exception as e:
+        print(f"Error checking 'mood' column: {str(e)}")
+        return False
+
+# Load NLP model
+try:
+    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+except Exception as e:
+    st.error(f"Error loading NLP model: {str(e)}")
+    tokenizer = None
+    model = None
+
+# Generate embedding with caching
 @st.cache_data
 def get_embedding(text):
     if tokenizer is None or model is None:
         return None
     try:
         inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=128)
-        inputs = {k: v.to('cpu') for k, v in inputs.items()}  # Ensure inputs are on CPU
-        outputs = model(**inputs).last_hidden_state.mean(dim=1).cpu().detach().numpy()
-        print(f"Embedding shape: {outputs.shape}")  # Debug output
+        outputs = model(**inputs).last_hidden_state.mean(dim=1).detach().numpy()
         if outputs.shape[1] != 384:
             st.warning(f"Expected 384 dimensions, got {outputs.shape[1]}. Using partial embedding.")
-            outputs = outputs[:, :384]  # Truncate to 384
+            outputs = outputs[:, :384]
         return outputs.tobytes()
     except Exception as e:
         st.error(f"Error generating embedding: {str(e)}")
         return None
 
-# Spotify token
-@st.cache_data(ttl=3600)
-def get_spotify_token():
-    try:
-        response = requests.post(
-            "https://accounts.spotify.com/api/token",
-            data={"grant_type": "client_credentials"},
-            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)
-        )
-        response.raise_for_status()
-        return response.json()["access_token"]
-    except Exception as e:
-        st.error(f"Error getting Spotify token: {str(e)}")
-        return None
-
-# Top tracks
-def get_top_mood_tracks(mood):
-    token = get_spotify_token()
-    if not token:
-        return None
-    try:
-        mood_map = {"Happy": "happy", "Sad": "sad", "Anxious": "anxious", "Calm": "relax"}
-        query = f"genre:{mood_map.get(mood, 'relax')} track:popular"
-        response = requests.get(
-            "https://api.spotify.com/v1/search",
-            params={"q": query, "type": "track", "limit": 5},
-            headers={"Authorization": f"Bearer {token}"}
-        )
-        response.raise_for_status()
-        tracks = response.json()["tracks"]["items"]
-        return [(track["name"], track["artists"][0]["name"], track["external_urls"]["spotify"]) for track in tracks]
-    except Exception as e:
-        st.error(f"Error fetching tracks: {str(e)}")
-        return None
-
-# Main app
+# Streamlit UI
 st.title("MoodLift: Holistic Mental Health Companion")
-st.markdown("<p style='color: #8BC34A; font-size: 12px;'>Your personalized mental well-being companion.</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #4CAF50; font-size: 16px; font-style: italic; text-align: center;'>Your personalized mental well-being companion.</p>", unsafe_allow_html=True)
 
-# Mood logging
 st.subheader("Log Your Mood")
-st.markdown("<p style='color: #8BC34A; font-size: 12px;'>Select your mood and share your thoughts to track your journey:</p>", unsafe_allow_html=True)
-mood = st.selectbox("How are you feeling?", ["Calm", "Happy", "Sad", "Anxious"])
-journal = st.text_area("What’s on your mind? (optional)", height=100)
-
-if st.button("Log Mood"):
+st.markdown("<p style='color: #2196F3; font-size: 14px;'>Select your mood and share your thoughts to track your journey:</p>", unsafe_allow_html=True)
+mood = st.selectbox("How are you feeling?", ["Happy", "Sad", "Anxious", "Calm"], key="mood_select", index=0)
+journal = st.text_area("What’s on your mind? (optional)", key="journal_input", height=100)
+if st.button("Log Mood", key="log_button", help="Record your current mood and thoughts"):
     with get_connection() as conn:
         if conn:
             try:
-                embedding = get_embedding(journal) if journal else get_embedding("No journal entry")
-                if embedding:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "INSERT INTO mood_logs (timestamp, mood, journal, embedding) VALUES (%s, %s, %s, %s)",
-                            (datetime.now(), mood, journal, embedding)
-                        )
-                        conn.commit()
-                    st.success("Mood logged successfully! Your journey is being tracked.")
-                else:
-                    st.error("Failed to generate embedding.")
+                with conn.cursor(prepared=True) as cur:
+                    cur.execute(
+                        "INSERT INTO mood_logs (timestamp, mood, journal, embedding) VALUES (%s, %s, %s, %s)",
+                        (datetime.now(), mood, journal or None, get_embedding(journal) or None)
+                    )
+                st.success("Mood logged successfully! Your journey is being tracked.")
             except Exception as e:
                 st.error(f"Error logging mood: {str(e)}")
 
-# Personalized suggestions
+if journal:
+    st.subheader("Community Insights")
+    st.markdown("<p style='color: #9C27B0; font-size: 12px;'>Discover how others feel based on similar thoughts:</p>", unsafe_allow_html=True)
+    with get_connection() as conn:
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT mood, COUNT(*) as count FROM mood_logs WHERE journal IS NOT NULL AND journal LIKE %s AND id != LAST_INSERT_ID() GROUP BY mood ORDER BY count DESC LIMIT 3",
+                        ('%' + journal[:50] + '%',)
+                    )
+                    similar = cur.fetchall()
+                    if similar:
+                        for row in similar:
+                            st.write(f"**Common mood**: {row[0]} (seen {row[1]} times)")
+                    else:
+                        cur.execute(
+                            "SELECT mood, journal FROM mood_logs WHERE journal IS NOT NULL AND journal LIKE %s AND id != LAST_INSERT_ID() LIMIT 3",
+                            ('%' + journal[:50] + '%',)
+                        )
+                        similar = cur.fetchall()
+                        if similar:
+                            for row in similar:
+                                st.write(f"**Someone felt**: {row[0]} - '{row[1][:50]}...'")
+                        else:
+                            st.write("No similar entries found yet.")
+            except Exception as e:
+                st.error(f"Error fetching insights: {str(e)}")
+
 st.subheader("Personalized Suggestions")
-st.markdown("<p style='color: #8BC34A; font-size: 12px;'>Tailored ideas to enhance your mood:</p>", unsafe_allow_html=True)
-if mood:
-    suggestion = f"Suggestion: {mood.lower() == 'calm' and 'Read a calming book' or 'Try a short walk'}"
-    st.write(suggestion)
+st.markdown("<p style='color: #FF9800; font-size: 12px;'>Tailored ideas to enhance your mood:</p>", unsafe_allow_html=True)
+suggestions = {
+    "Sad": ["Try a 5-minute breathing exercise.", "Write down three things you’re grateful for.", "Watch a funny video.", "Talk to a loved one.", "Listen to calming music."],
+    "Anxious": ["Take a short walk.", "Try a mindfulness meditation.", "Talk to a friend.", "Practice progressive muscle relaxation.", "Listen to a guided relaxation audio."],
+    "Happy": ["Plan a fun outing with friends.", "Celebrate with a small treat like your favorite snack.", "Create a playlist of upbeat songs.", "Reflect on a happy memory.", "Share your joy with someone!"],
+    "Calm": ["Reflect on your day in a journal.", "Try a relaxing yoga session.", "Listen to nature sounds.", "Practice gentle stretching.", "Read a calming book."]
+}
+suggestion = np.random.choice(suggestions.get(mood, ["Keep shining!"]))
+st.write(f"**Suggestion**: {suggestion}")
 
-# Recommended resources
 st.subheader("Recommended Resources")
-st.markdown("<p style='color: #8BC34A; font-size: 12px;'>Mood-specific activities and links to support you:</p>", unsafe_allow_html=True)
-if mood:
-    resource = f"Resource: {mood.lower() == 'calm' and 'Do a guided stretching routine' or 'Listen to upbeat music'}"
-    st.write(resource)
+st.markdown("<p style='color: #607D8B; font-size: 12px;'>Mood-specific activities and links to support you:</p>", unsafe_allow_html=True)
+with get_connection() as conn:
+    if conn:
+        try:
+            mood_column_exists = check_mood_column(conn)
+            if mood_column_exists:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT content FROM resources WHERE type = 'activity' AND (mood = %s OR mood IS NULL) ORDER BY RAND() LIMIT 1", (mood,))
+                    resource = cur.fetchone()
+                    if resource:
+                        st.write(f"**Resource**: {resource[0]}")
+                    else:
+                        st.write("No resources available for this mood. Please add more to the resources table.")
+            else:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT content FROM resources WHERE type = 'activity' ORDER BY RAND() LIMIT 1")
+                    resource = cur.fetchone()
+                    if resource:
+                        st.write(f"**Resource**: {resource[0]} (General recommendation)")
+                    else:
+                        st.write("No resources available. Please add more to the resources table.")
+        except mysql.connector.Error as e:
+            st.error(f"Error fetching resources: {str(e)} - Ensure the resources table exists and has data.")
 
-# Mood trends
 st.subheader("Mood Trends")
-st.markdown("<p style='color: #8BC34A; font-size: 12px;'>Visualize your mood journey over time:</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #795548; font-size: 12px;'>Visualize your mood journey over time:</p>", unsafe_allow_html=True)
 with get_connection() as conn:
     if conn:
         try:
@@ -225,7 +301,6 @@ with get_connection() as conn:
         except Exception as e:
             st.error(f"Error displaying trends: {str(e)}")
 
-# Mood prediction
 st.subheader("Mood Prediction")
 st.markdown("<p style='color: #8BC34A; font-size: 12px;'>A glimpse into your next mood based on trends:</p>", unsafe_allow_html=True)
 with get_connection() as conn:
@@ -252,7 +327,6 @@ with get_connection() as conn:
         except Exception as e:
             st.error(f"Error predicting mood: {str(e)}")
 
-# Top 5 tracks
 st.subheader("Top 5 Tracks for Your Mood")
 top_tracks = get_top_mood_tracks(mood)
 if top_tracks:
