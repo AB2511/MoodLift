@@ -15,7 +15,6 @@ from dotenv import load_dotenv  # For local development
 
 # Load .env file for local development
 load_dotenv()
-
 # Determine environment and load secrets
 is_cloud = hasattr(st, 'secrets')
 if is_cloud:
